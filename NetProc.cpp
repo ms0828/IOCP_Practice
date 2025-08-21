@@ -152,30 +152,12 @@ unsigned int WorkerThreadNetProc(void* arg)
 			cout << "transferred = 0 -> Session id : "<< session->sessionId << " - Disconnected On" << endl;
 			cout << "recvQ가 다 찼거나 FIN을 수신했습니다. 혹은 연결이 끊겼습니다." << endl;
 
-			// ----------------------------------------------------------------
-			// bDisconnected 플래그 설정이 IOCount 차감보다 먼저 수행되어야함
-			// ----------------------------------------------------------------
-			InterlockedExchange((LONG*)&session->bDisconnected, true);
 			if (InterlockedDecrement((LONG*)&session->ioCount) == 0) 
-			{
 				TryDeleteSession(session);
-			}
-
+			
 			continue;
 		}
-		
-
-		// ----------------------------------------------------------------
-		// IOCount 감소 후, 세션 정리 시점 확인
-		// ----------------------------------------------------------------
-		if (InterlockedDecrement((LONG*)&session->ioCount) == 0 && session->bDisconnected)
-		{
-			TryDeleteSession(session);
-			continue;
-		}
-	
-
-
+			
 		//---------------------------------------------------------
 		// Recv 완료 처리
 		//---------------------------------------------------------
@@ -187,7 +169,7 @@ unsigned int WorkerThreadNetProc(void* arg)
 			
 
 			// ------------------------------------------
-			// 받은 데이터를 SendQ에 보관
+			// 받은 데이터를 SendQ에 Enqueue
 			// ------------------------------------------
 			char localBuf[40000];
 			int dequeueRet = session->recvQ->Dequeue(localBuf, transferred);
@@ -205,18 +187,15 @@ unsigned int WorkerThreadNetProc(void* arg)
 			{
 				cout << " 송신 버퍼 공간이 모자랍니다. sendQ Free size == " << session->sendQ->GetFreeSize() << endl;
 				if (InterlockedDecrement((LONG*)&session->ioCount) == 0)
-				{
 					TryDeleteSession(session);
-				}
+				continue;
 			}
 
 			// ------------------------------------------
 			// SendQ에 있는 데이터를 전송
 			// ------------------------------------------
-			if (InterlockedCompareExchange((LONG*)&session->bIsSending, true, false) == false)
-			{
-				SendPost(session);
-			}
+			SendPost(session);
+			
 
 			// ------------------------------------------
 			// 다시 Recv 걸기
@@ -232,6 +211,15 @@ unsigned int WorkerThreadNetProc(void* arg)
 			cout << "------------CompletionPort : Send------------\n";
 			cout << "Send Complete / transferred : " << transferred << endl; 
 			InterlockedExchange((LONG*)&session->bIsSending, false);
+		}
+
+		// ----------------------------------------------------------------
+		// IOCount 감소 후, 세션 정리 시점 확인
+		// ----------------------------------------------------------------
+		if (InterlockedDecrement((LONG*)&session->ioCount) == 0)
+		{
+			TryDeleteSession(session);
+			continue;
 		}
 	}
 
@@ -290,7 +278,10 @@ void RecvPost(Session* session)
 
 void SendPost(Session* session)
 {
+	if (InterlockedCompareExchange((LONG*)&session->bIsSending, true, false) == true)
+		return;
 	InterlockedIncrement((LONG*)&session->ioCount);
+
 	printf("------------AsyncSend  session id : %d------------\n", session->sessionId);
 	WSABUF wsaSendBufArr[2];
 	int wsaBufCnt = 1;
@@ -339,13 +330,13 @@ void SendPost(Session* session)
 			cout << "send error : " << error << "\n";
 		}
 	}
-	
-
 	return;
 }
 
 void TryDeleteSession(Session* session)
 {
+	cout << "TryDeleteSession - id : " << session->sessionId << endl;
+
 	closesocket(session->sock);
 
 	// 세션 삭제 (락 필요)
