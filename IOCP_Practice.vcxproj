@@ -124,13 +124,16 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="CPacket.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="NetProc.cpp" />
     <ClCompile Include="RingBuffer.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="CPacket.h" />
     <ClInclude Include="NetProc.h" />
     <ClInclude Include="Profiler.h" />
+    <ClInclude Include="Protocol.h" />
     <ClInclude Include="RingBuffer.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

@@ -24,6 +24,9 @@
     <ClCompile Include="NetProc.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
+    <ClCompile Include="CPacket.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="RingBuffer.h">
@@ -33,6 +36,12 @@
       <Filter>헤더 파일</Filter>
     </ClInclude>
     <ClInclude Include="NetProc.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="Protocol.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="CPacket.h">
       <Filter>헤더 파일</Filter>
     </ClInclude>
   </ItemGroup>

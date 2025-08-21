@@ -1,6 +1,8 @@
 #include "NetProc.h"
 #include <iostream>
 #include <unordered_map>
+#include "Protocol.h"
+
 
 #define PROFILE
 #include "Profiler.h"
@@ -68,7 +70,6 @@ void NetStartUp()
 		cout << "listen error";
 		exit(1);
 	}
-
 }
 
 unsigned int AcceptProc(void* arg)
@@ -100,7 +101,6 @@ unsigned int AcceptProc(void* arg)
 
 	return 0;
 }
-
 
 unsigned int WorkerThreadNetProc(void* arg)
 {
@@ -140,24 +140,25 @@ unsigned int WorkerThreadNetProc(void* arg)
 		
 		
 		// ------------------------------------------
-		// transferred가 0이 되는 상황
+		// [ transferred가 0이 되는 상황 ]
 		// - RST로 인한 I/O 실패
 		// - FIN으로 인한 I/O 성공
 		// 
-		// [예외 처리]
+		// [ transferred가 0일 때 처리 ]
 		// - 즉시 세션 삭제 불가
+		// - 세션 종료 플래그를 활성화
 		// ------------------------------------------
 		if (transferred == 0)
 		{
 			cout << "transferred = 0 -> Session id : "<< session->sessionId << " - Disconnected On" << endl;
 			cout << "recvQ가 다 찼거나 FIN을 수신했습니다. 혹은 연결이 끊겼습니다." << endl;
-
+			InterlockedExchange((LONG*)&session->bDisconnected, true);
 			if (InterlockedDecrement((LONG*)&session->ioCount) == 0) 
-				TryDeleteSession(session);
+				DisconnectSession(session);
 			
 			continue;
 		}
-			
+		
 		//---------------------------------------------------------
 		// Recv 완료 처리
 		//---------------------------------------------------------
@@ -166,36 +167,42 @@ unsigned int WorkerThreadNetProc(void* arg)
 			session->recvQ->MoveRear(transferred);
 			cout << "------------CompletionPort : Recv------------\n";
 			cout << "Recv Complete / transferred : " << transferred << endl;
-			
 
-			// ------------------------------------------
-			// 받은 데이터를 SendQ에 Enqueue
-			// ------------------------------------------
-			char localBuf[40000];
-			int dequeueRet = session->recvQ->Dequeue(localBuf, transferred);
-
-			// 디버깅용 - 정상적인 경우라면 이 예외가 일어날 수 없음
-			if (dequeueRet != transferred) 
+			//----------------------------------------------------
+			// 에코 컨텐츠 처리
+			//----------------------------------------------------
+			while (1)
 			{
-				cout << "RingBuffer Error : dequeuRet != transferred\n";
-				exit(1);
+				//-------------------------------------------
+				// 완성된 메시지 추출
+				//-------------------------------------------
+				st_Header header;
+				int peekLen = session->recvQ->Peek((char *)&header, sizeof(header));
+				if (peekLen < sizeof(header))
+					break;
+				if (session->recvQ->GetUseSize() < sizeof(header) + header.payloadLen)
+					break;
+				session->recvQ->MoveFront(sizeof(header));
+				
+				char localBuf[MAX_ECHOBYTE];
+				int dequeueRet = session->recvQ->Dequeue(localBuf, header.payloadLen);
+
+				//-------------------------------------------
+				// - 간단한 에코 서버이므로, 완성된 메시지를 헤더 타입으로 분류하여 메시지 별 처리하는 과정은 생략
+				// - 아래서 바로 에코(컨텐츠) 처리
+				//-------------------------------------------
+				
+				//-------------------------------------------
+				// 패킷 생성부
+				//-------------------------------------------
+				CPacket packet;
+				packet.PutData((char*)&header, sizeof(header));
+				packet.PutData(localBuf, dequeueRet);
+				bool sendRet = SendPacket(session, &packet);	
+				if (sendRet == false)
+					break;
 			}
 
-			int enqueueRet = session->sendQ->Enqueue(localBuf, transferred);
-			printf("recvQ -> sendQ 에코 데이터 enqueue Size : %d\n", enqueueRet);
-			if (enqueueRet == 0)
-			{
-				cout << " 송신 버퍼 공간이 모자랍니다. sendQ Free size == " << session->sendQ->GetFreeSize() << endl;
-				if (InterlockedDecrement((LONG*)&session->ioCount) == 0)
-					TryDeleteSession(session);
-				continue;
-			}
-
-			// ------------------------------------------
-			// SendQ에 있는 데이터를 전송
-			// ------------------------------------------
-			SendPost(session);
-			
 
 			// ------------------------------------------
 			// 다시 Recv 걸기
@@ -211,14 +218,24 @@ unsigned int WorkerThreadNetProc(void* arg)
 			cout << "------------CompletionPort : Send------------\n";
 			cout << "Send Complete / transferred : " << transferred << endl; 
 			InterlockedExchange((LONG*)&session->bIsSending, false);
+
+			//---------------------------------------------------------
+			// Send 송신 중에 SendQ에 전송할 데이터가 쌓였다면 다시 Send
+			// - SendQ의 저장된 데이터가 없을 경우 transferred 0으로 잘못된 종료 판단이 가능하니 체크 필수 
+			//---------------------------------------------------------
+			AcquireSRWLockExclusive(&session->lock);
+			if(session->sendQ->GetUseSize() > 0)
+				SendPost(session);
+			ReleaseSRWLockExclusive(&session->lock);
 		}
+		
 
 		// ----------------------------------------------------------------
 		// IOCount 감소 후, 세션 정리 시점 확인
 		// ----------------------------------------------------------------
 		if (InterlockedDecrement((LONG*)&session->ioCount) == 0)
 		{
-			TryDeleteSession(session);
+			DisconnectSession(session);
 			continue;
 		}
 	}
@@ -226,15 +243,35 @@ unsigned int WorkerThreadNetProc(void* arg)
 	return 0;
 }
 
+bool SendPacket(Session* session, CPacket* packet)
+{
+	AcquireSRWLockExclusive(&session->lock);
+	int enqueueRet = session->sendQ->Enqueue(packet->GetBufferPtr(), packet->GetDataSize());
+	//-------------------------------------------
+	// 송신 버퍼 공간이 모자랄 때 예외 처리
+	// - 종료 플래그를 활성화 -> 세션 종료 유도한다.
+	//-------------------------------------------
+	if (enqueueRet == 0)
+	{
+		cout << " 송신 버퍼 공간이 모자랍니다. sendQ Free size == " << session->sendQ->GetFreeSize() << endl;
+		InterlockedExchange((LONG*)&session->bDisconnected, true);
+		ReleaseSRWLockExclusive(&session->lock);
+		return false;
+	}
+
+	SendPost(session);
+	ReleaseSRWLockExclusive(&session->lock);
+	return true;
+}
+
 void RecvPost(Session* session)
 {
-	InterlockedIncrement((LONG*)&session->ioCount);
-	printf("------------AsyncRecv  session id : %d------------\n", session->sessionId);
-	
 	WSABUF wsaRecvBufArr[2];
 	int wsaBufCnt = 1;
 	int directEnqueueSize = session->recvQ->DirectEnqueueSize();
 	int totalFreeSize = session->recvQ->GetFreeSize();
+	if (totalFreeSize == 0 || session->bDisconnected)
+		return;
 	wsaRecvBufArr[0].buf = session->recvQ->GetRearBufferPtr();
 	wsaRecvBufArr[0].len = directEnqueueSize;
 	if (directEnqueueSize < totalFreeSize)
@@ -245,7 +282,8 @@ void RecvPost(Session* session)
 		wsaBufCnt = 2;
 	}
 
-
+	InterlockedIncrement((LONG*)&session->ioCount);
+	printf("------------AsyncRecv  session id : %d------------\n", session->sessionId);
 	cout << "recvQ total Free Size : " << session->recvQ->GetFreeSize() << endl;
 	DWORD recvBytes;
 	DWORD flags = 0;
@@ -268,18 +306,20 @@ void RecvPost(Session* session)
 		else
 		{
 			if (InterlockedDecrement((LONG*)&session->ioCount) == 0)
-			{
-				TryDeleteSession(session);
-			}
+				DisconnectSession(session);
 			cout << "recv error : " << error;
 		}
 	}
 }
 
+
+
+
 void SendPost(Session* session)
 {
-	if (InterlockedCompareExchange((LONG*)&session->bIsSending, true, false) == true)
+	if (InterlockedCompareExchange((LONG*)&session->bIsSending, true, false) == true || session->bDisconnected)
 		return;
+
 	InterlockedIncrement((LONG*)&session->ioCount);
 
 	printf("------------AsyncSend  session id : %d------------\n", session->sessionId);
@@ -296,13 +336,9 @@ void SendPost(Session* session)
 		wsaSendBufArr[1].len = remainUseSize;
 		wsaBufCnt = 2;
 	}
-
-	cout << "SendQ total Use Size : " << session->sendQ->GetUseSize() << endl;
 	DWORD sendBytes;
 	int sendRet = WSASend(session->sock, wsaSendBufArr, wsaBufCnt, &sendBytes, 0, (WSAOVERLAPPED*)&session->sendOlp, nullptr);
 	
-
-
 	//-------------------------------------
 	// Fast I/O
 	//-------------------------------------
@@ -324,23 +360,20 @@ void SendPost(Session* session)
 		else
 		{
 			if (InterlockedDecrement((LONG*)&session->ioCount) == 0)
-			{
-				TryDeleteSession(session);
-			}
+				DisconnectSession(session);
 			cout << "send error : " << error << "\n";
 		}
 	}
 	return;
 }
 
-void TryDeleteSession(Session* session)
+void DisconnectSession(Session* session)
 {
 	cout << "TryDeleteSession - id : " << session->sessionId << endl;
 
 	closesocket(session->sock);
 
 	// 세션 삭제 (락 필요)
-	int eraseRet = g_SessionMap.erase(session->sessionId);
-	
+	g_SessionMap.erase(session->sessionId);
 	delete session;
 }
