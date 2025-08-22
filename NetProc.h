@@ -1,5 +1,6 @@
 #pragma once
 #include <WinSock2.h>
+#include <unordered_map>
 #include "RingBuffer.h"
 #include "CPacket.h"
 #pragma comment (lib, "ws2_32")

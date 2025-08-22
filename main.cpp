@@ -9,7 +9,7 @@
 using namespace std;
 
 extern HANDLE hCp;
-
+extern unordered_map<unsigned int, Session*> g_SessionMap;
 int main()
 {
 
@@ -37,10 +37,7 @@ int main()
 
 			if (ControlKey == L's' || ControlKey == L'S')
 			{
-				//ProfileDataOutText("WSASend_8192btes.txt");
-				//cout << "저장완료\n";
-
-				CloseHandle(hCp);
+				
 			}
 		}
 	}

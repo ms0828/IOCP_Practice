@@ -1,6 +1,6 @@
 #include "NetProc.h"
 #include <iostream>
-#include <unordered_map>
+
 #include "Protocol.h"
 
 
@@ -15,7 +15,7 @@ HANDLE hCp;
 unsigned int g_SessionIdCnt = 0;
 
 unordered_map<unsigned int, Session*> g_SessionMap;
-
+SRWLOCK g_SessionMapLock;
 
 void NetStartUp()
 {
@@ -152,10 +152,9 @@ unsigned int WorkerThreadNetProc(void* arg)
 		{
 			cout << "transferred = 0 -> Session id : "<< session->sessionId << " - Disconnected On" << endl;
 			cout << "recvQ가 다 찼거나 FIN을 수신했습니다. 혹은 연결이 끊겼습니다." << endl;
-			InterlockedExchange((LONG*)&session->bDisconnected, true);
+			InterlockedExchange8((char*)&session->bDisconnected, true);
 			if (InterlockedDecrement((LONG*)&session->ioCount) == 0) 
 				DisconnectSession(session);
-			
 			continue;
 		}
 		
@@ -220,13 +219,9 @@ unsigned int WorkerThreadNetProc(void* arg)
 			InterlockedExchange((LONG*)&session->bIsSending, false);
 
 			//---------------------------------------------------------
-			// Send 송신 중에 SendQ에 전송할 데이터가 쌓였다면 다시 Send
-			// - SendQ의 저장된 데이터가 없을 경우 transferred 0으로 잘못된 종료 판단이 가능하니 체크 필수 
+			// Send 송신 중에 SendQ에 전송할 데이터가 쌓였다면 다시 Send 
 			//---------------------------------------------------------
-			AcquireSRWLockExclusive(&session->lock);
-			if(session->sendQ->GetUseSize() > 0)
-				SendPost(session);
-			ReleaseSRWLockExclusive(&session->lock);
+			SendPost(session);
 		}
 		
 
@@ -247,6 +242,8 @@ bool SendPacket(Session* session, CPacket* packet)
 {
 	AcquireSRWLockExclusive(&session->lock);
 	int enqueueRet = session->sendQ->Enqueue(packet->GetBufferPtr(), packet->GetDataSize());
+	ReleaseSRWLockExclusive(&session->lock);
+
 	//-------------------------------------------
 	// 송신 버퍼 공간이 모자랄 때 예외 처리
 	// - 종료 플래그를 활성화 -> 세션 종료 유도한다.
@@ -254,13 +251,13 @@ bool SendPacket(Session* session, CPacket* packet)
 	if (enqueueRet == 0)
 	{
 		cout << " 송신 버퍼 공간이 모자랍니다. sendQ Free size == " << session->sendQ->GetFreeSize() << endl;
-		InterlockedExchange((LONG*)&session->bDisconnected, true);
-		ReleaseSRWLockExclusive(&session->lock);
+		InterlockedExchange8((char*)&session->bDisconnected, true);
 		return false;
 	}
+	
 
 	SendPost(session);
-	ReleaseSRWLockExclusive(&session->lock);
+	
 	return true;
 }
 
@@ -313,22 +310,26 @@ void RecvPost(Session* session)
 }
 
 
-
-
 void SendPost(Session* session)
 {
 	if (InterlockedCompareExchange((LONG*)&session->bIsSending, true, false) == true || session->bDisconnected)
 		return;
-
-	InterlockedIncrement((LONG*)&session->ioCount);
-
+	
 	printf("------------AsyncSend  session id : %d------------\n", session->sessionId);
 	WSABUF wsaSendBufArr[2];
 	int wsaBufCnt = 1;
+	AcquireSRWLockExclusive(&session->lock);
 	int directDequeueSize = session->sendQ->DirectDequeueSize();
 	int totalUseSize = session->sendQ->GetUseSize();
+	if (totalUseSize == 0)
+	{
+		InterlockedExchange((LONG*)&session->bIsSending, false);
+		ReleaseSRWLockExclusive(&session->lock);
+		return;
+	}
 	wsaSendBufArr[0].buf = session->sendQ->GetFrontBufferPtr();
 	wsaSendBufArr[0].len = directDequeueSize;
+	ReleaseSRWLockExclusive(&session->lock);
 	if (directDequeueSize < totalUseSize)
 	{
 		int remainUseSize = totalUseSize - directDequeueSize;
@@ -336,6 +337,9 @@ void SendPost(Session* session)
 		wsaSendBufArr[1].len = remainUseSize;
 		wsaBufCnt = 2;
 	}
+
+	
+	InterlockedIncrement((LONG*)&session->ioCount);
 	DWORD sendBytes;
 	int sendRet = WSASend(session->sock, wsaSendBufArr, wsaBufCnt, &sendBytes, 0, (WSAOVERLAPPED*)&session->sendOlp, nullptr);
 	
@@ -373,7 +377,10 @@ void DisconnectSession(Session* session)
 
 	closesocket(session->sock);
 
-	// 세션 삭제 (락 필요)
+	// 세션 맵에서 해당 세션 삭제
+	AcquireSRWLockExclusive(&g_SessionMapLock);
 	g_SessionMap.erase(session->sessionId);
+	ReleaseSRWLockExclusive(&g_SessionMapLock);
+
 	delete session;
 }
