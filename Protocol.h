@@ -8,3 +8,10 @@ struct st_Header
 {
 	unsigned short payloadLen;
 };
+
+
+struct st_JobMessage
+{
+	ULONG sessionId;
+	__int64 echoData;
+};

@@ -42,13 +42,13 @@ public:
 
 public:
 	SOCKET sock;
-	unsigned int sessionId;
+	ULONG sessionId;
 	SessionOverlapped sendOlp;
 	SessionOverlapped recvOlp;
 	CRingBuffer* sendQ;
 	CRingBuffer* recvQ;
 	SRWLOCK lock;
-	bool bIsSending;
+	LONG bIsSending;
 	bool bDisconnected;
 	unsigned int ioCount;
 };
@@ -59,13 +59,17 @@ unsigned int AcceptProc(void *arg);
 
 unsigned int WorkerThreadNetProc(void* arg);
 
+unsigned int EchoThreadProc(void* arg);
+
+void OnMessage(ULONG sessionId, CPacket* message);
+
 //-------------------------------------------
 // SendPacket : SendQ에 전송할 데이터 Enqueue 후, SendPost 호출 
 // - 실패 시 세션 종료 플래그 활성화
 // [ SendPacket 실패 요소 ]
 // - SendQ가 다 찬 경우
 //-------------------------------------------
-bool SendPacket(Session* session, CPacket* packet);
+bool SendPacket(ULONG sessionId, CPacket* packet);
 
 
 // --------------------------------------------------------------

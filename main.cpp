@@ -24,8 +24,7 @@ int main()
 	HANDLE worker3 = (HANDLE)_beginthreadex(nullptr, 0, WorkerThreadNetProc, nullptr, 0, nullptr);
 	HANDLE worker4 = (HANDLE)_beginthreadex(nullptr, 0, WorkerThreadNetProc, nullptr, 0, nullptr);
 	HANDLE worker5 = (HANDLE)_beginthreadex(nullptr, 0, WorkerThreadNetProc, nullptr, 0, nullptr);
-	HANDLE worker6 = (HANDLE)_beginthreadex(nullptr, 0, WorkerThreadNetProc, nullptr, 0, nullptr);
-	HANDLE worker7 = (HANDLE)_beginthreadex(nullptr, 0, WorkerThreadNetProc, nullptr, 0, nullptr);
+	HANDLE echoWorker = (HANDLE)_beginthreadex(nullptr, 0, EchoThreadProc, nullptr, 0, nullptr);
 	
 
 

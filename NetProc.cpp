@@ -12,13 +12,22 @@ using namespace std;
 SOCKET listenSock;
 HANDLE hCp;
 
-unsigned int g_SessionIdCnt = 0;
+unsigned int g_SessionIdCnt = 1;
 
 unordered_map<unsigned int, Session*> g_SessionMap;
 SRWLOCK g_SessionMapLock;
 
+
+CRingBuffer g_JobQ;
+SRWLOCK g_JogQLock;
+HANDLE g_JobEvent;
+
 void NetStartUp()
 {
+	// Job 이벤트 생성
+	g_JobEvent = CreateEvent(nullptr, false, false, nullptr);
+
+
 	// Completion Port 생성
 	hCp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
 
@@ -102,6 +111,7 @@ unsigned int AcceptProc(void* arg)
 	return 0;
 }
 
+
 unsigned int WorkerThreadNetProc(void* arg)
 {
 	while (1)
@@ -167,9 +177,6 @@ unsigned int WorkerThreadNetProc(void* arg)
 			cout << "------------CompletionPort : Recv------------\n";
 			cout << "Recv Complete / transferred : " << transferred << endl;
 
-			//----------------------------------------------------
-			// 에코 컨텐츠 처리
-			//----------------------------------------------------
 			while (1)
 			{
 				//-------------------------------------------
@@ -183,23 +190,32 @@ unsigned int WorkerThreadNetProc(void* arg)
 					break;
 				session->recvQ->MoveFront(sizeof(header));
 				
-				char localBuf[MAX_ECHOBYTE];
-				int dequeueRet = session->recvQ->Dequeue(localBuf, header.payloadLen);
 
 				//-------------------------------------------
-				// - 간단한 에코 서버이므로, 완성된 메시지를 헤더 타입으로 분류하여 메시지 별 처리하는 과정은 생략
-				// - 아래서 바로 에코(컨텐츠) 처리
+				// payloadLen 검사
+				// - 설계된 데이터 길이 이상 보냈다면 연결 끊기
 				//-------------------------------------------
-				
-				//-------------------------------------------
-				// 패킷 생성부
-				//-------------------------------------------
-				CPacket packet;
-				packet.PutData((char*)&header, sizeof(header));
-				packet.PutData(localBuf, dequeueRet);
-				bool sendRet = SendPacket(session, &packet);	
-				if (sendRet == false)
+				if (header.payloadLen > MAX_ECHOBYTE)
+				{
+					InterlockedExchange8((char*)&session->bDisconnected, true);
 					break;
+				}
+
+				//-------------------------------------------
+				// 메시지 추출
+				//-------------------------------------------
+				char messageBuf[MAX_ECHOBYTE];
+				int dequeueRet = session->recvQ->Dequeue(messageBuf, header.payloadLen);
+				CPacket message;
+				message.PutData((char*)&header, sizeof(header));
+				int putDataRet = message.PutData(messageBuf, header.payloadLen);
+				if (putDataRet == 0)
+				{
+					InterlockedExchange8((char*)&session->bDisconnected, true);
+					break;
+				}
+
+				OnMessage(session->sessionId, &message);
 			}
 
 
@@ -216,7 +232,7 @@ unsigned int WorkerThreadNetProc(void* arg)
 			session->sendQ->MoveFront(transferred);
 			cout << "------------CompletionPort : Send------------\n";
 			cout << "Send Complete / transferred : " << transferred << endl; 
-			InterlockedExchange((LONG*)&session->bIsSending, false);
+			InterlockedExchange(&session->bIsSending, false);
 
 			//---------------------------------------------------------
 			// Send 송신 중에 SendQ에 전송할 데이터가 쌓였다면 다시 Send 
@@ -238,8 +254,76 @@ unsigned int WorkerThreadNetProc(void* arg)
 	return 0;
 }
 
-bool SendPacket(Session* session, CPacket* packet)
+unsigned int EchoThreadProc(void* arg)
 {
+	while (1)
+	{
+		if(g_JobQ.GetUseSize() == 0)
+			WaitForSingleObject(g_JobEvent, INFINITE);
+
+		// 동시 Dequeue가 안되도록 Lock (사실 EchoThread가 1개 이므로 락이 필요 없긴 함)
+		//AcquireSRWLockExclusive(&g_JogQLock);
+		st_JobMessage message;
+		message.sessionId = 0;
+		message.echoData = 0;
+		int dequeueRet = g_JobQ.Dequeue((char*)&message, sizeof(st_JobMessage));
+		//ReleaseSRWLockExclusive(&g_JogQLock);
+		
+		if (dequeueRet == 0)
+			continue;
+
+		st_Header header;
+		header.payloadLen = 8;
+		CPacket packet;
+		packet.PutData((char*)&header, sizeof(header));
+		packet.PutData((char*)&message.echoData, sizeof(__int64));
+		SendPacket(message.sessionId, &packet);
+	}
+
+	return 0;
+}
+
+
+void OnMessage(ULONG sessionId, CPacket* message)
+{
+	//-------------------------------------------
+	// - 간단한 에코 서버이므로, 메시지를 헤더 타입으로 분류하여 메시지 종류별 처리하는 과정은 생략
+	// - 현재 에코 더미 자체가 헤더 안에 메시지 타입을 기재하고 있지 않음
+	//-------------------------------------------
+	unsigned short payloadLen;
+	__int64 echoData;
+	*message >> payloadLen;
+	*message >> echoData;
+	
+	st_JobMessage jobMsg;
+	jobMsg.sessionId = sessionId;
+	jobMsg.echoData = echoData;
+	AcquireSRWLockExclusive(&g_JogQLock);
+	int enqueueRet = g_JobQ.Enqueue((char*)&jobMsg, sizeof(jobMsg));
+	ReleaseSRWLockExclusive(&g_JogQLock);
+	if (enqueueRet == 0)
+	{
+		cout << "JobQ가 다 찼습니다.\n";
+		exit(1);
+	}
+	SetEvent(g_JobEvent);
+}
+
+bool SendPacket(ULONG sessionId, CPacket* packet)
+{
+	// 세션 검색
+	AcquireSRWLockExclusive(&g_SessionMapLock);
+	const auto it = g_SessionMap.find(sessionId);
+	if (it == g_SessionMap.end())
+	{
+		ReleaseSRWLockExclusive(&g_SessionMapLock);
+		return false;
+	}
+	Session* session = it->second;
+	ReleaseSRWLockExclusive(&g_SessionMapLock);
+	
+
+
 	AcquireSRWLockExclusive(&session->lock);
 	int enqueueRet = session->sendQ->Enqueue(packet->GetBufferPtr(), packet->GetDataSize());
 	ReleaseSRWLockExclusive(&session->lock);
@@ -255,14 +339,15 @@ bool SendPacket(Session* session, CPacket* packet)
 		return false;
 	}
 	
-
 	SendPost(session);
-	
 	return true;
 }
 
 void RecvPost(Session* session)
 {
+	if (session->bDisconnected)
+		return;
+
 	WSABUF wsaRecvBufArr[2];
 	int wsaBufCnt = 1;
 	int directEnqueueSize = session->recvQ->DirectEnqueueSize();
@@ -312,7 +397,7 @@ void RecvPost(Session* session)
 
 void SendPost(Session* session)
 {
-	if (InterlockedCompareExchange((LONG*)&session->bIsSending, true, false) == true || session->bDisconnected)
+	if (InterlockedCompareExchange(&session->bIsSending, true, false) == true || session->bDisconnected)
 		return;
 	
 	printf("------------AsyncSend  session id : %d------------\n", session->sessionId);
@@ -323,7 +408,7 @@ void SendPost(Session* session)
 	int totalUseSize = session->sendQ->GetUseSize();
 	if (totalUseSize == 0)
 	{
-		InterlockedExchange((LONG*)&session->bIsSending, false);
+		InterlockedExchange(&session->bIsSending, false);
 		ReleaseSRWLockExclusive(&session->lock);
 		return;
 	}
@@ -338,7 +423,6 @@ void SendPost(Session* session)
 		wsaBufCnt = 2;
 	}
 
-	
 	InterlockedIncrement((LONG*)&session->ioCount);
 	DWORD sendBytes;
 	int sendRet = WSASend(session->sock, wsaSendBufArr, wsaBufCnt, &sendBytes, 0, (WSAOVERLAPPED*)&session->sendOlp, nullptr);
