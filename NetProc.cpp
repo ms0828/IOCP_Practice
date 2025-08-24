@@ -261,7 +261,7 @@ unsigned int EchoThreadProc(void* arg)
 		if(g_JobQ.GetUseSize() == 0)
 			WaitForSingleObject(g_JobEvent, INFINITE);
 
-		// 동시 Dequeue가 안되도록 Lock (사실 EchoThread가 1개 이므로 락이 필요 없긴 함)
+		// 동시 Dequeue가 안되도록 Lock (사실 EchoThread가 1개 이므로 락이 필요 없음)
 		//AcquireSRWLockExclusive(&g_JogQLock);
 		st_JobMessage message;
 		message.sessionId = 0;
