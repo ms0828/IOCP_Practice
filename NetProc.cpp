@@ -99,12 +99,21 @@ unsigned int AcceptProc(void* arg)
 		// 2. Completion Port와 해당 세션 소켓 연결
 		//-----------------------------------------
 		Session* newSession = new Session(clnSock, g_SessionIdCnt++);
+		AcquireSRWLockExclusive(&g_SessionMapLock);
 		g_SessionMap.insert({ newSession->sessionId, newSession });
-		CreateIoCompletionPort((HANDLE)newSession->sock, hCp, (ULONG_PTR)newSession, 0);
+		ReleaseSRWLockExclusive(&g_SessionMapLock);
+
+		CreateIoCompletionPort((HANDLE)newSession->sock, hCp, (ULONG_PTR)newSession->sessionId, 0);
+
 		
 		// ---------------------------------------
 		// 초기 Recv 걸기
 		// ---------------------------------------
+		/*SessionLock(newSession);
+		int recvPostRet = RecvPost(newSession);
+		if (recvPostRet)
+			SessionUnlock(newSession);*/
+
 		RecvPost(newSession);
 	}
 
@@ -127,9 +136,10 @@ unsigned int WorkerThreadNetProc(void* arg)
 		//		- I/O 성공 및 Dequeue 성공
 		//--------------------------------------------------------------
 		DWORD transferred = 0;
-		Session* session = nullptr;
+		//Session* session = nullptr;
+		ULONGLONG sessionId;
 		SessionOverlapped* sessionOlp;
-		bool gqcsRet = GetQueuedCompletionStatus(hCp, &transferred, (PULONG_PTR)&session, (LPOVERLAPPED*)&sessionOlp, INFINITE);
+		bool gqcsRet = GetQueuedCompletionStatus(hCp, &transferred, (PULONG_PTR)&sessionId, (LPOVERLAPPED*)&sessionOlp, INFINITE);
 
 		//--------------------------------------------------------------
 		// lpOverlapped가 null인지는 무조건 확인 필요 
@@ -148,6 +158,17 @@ unsigned int WorkerThreadNetProc(void* arg)
 			return 0;
 		}
 		
+
+		AcquireSRWLockExclusive(&g_SessionMapLock);
+		const auto it = g_SessionMap.find(sessionId);
+		if (it == g_SessionMap.end())
+		{
+			ReleaseSRWLockExclusive(&g_SessionMapLock);
+			continue;
+		}
+		Session* session = it->second;
+		SessionLock(session);
+		ReleaseSRWLockExclusive(&g_SessionMapLock);
 		
 		// ------------------------------------------
 		// [ transferred가 0이 되는 상황 ]
@@ -163,8 +184,10 @@ unsigned int WorkerThreadNetProc(void* arg)
 			cout << "transferred = 0 -> Session id : "<< session->sessionId << " - Disconnected On" << endl;
 			cout << "recvQ가 다 찼거나 FIN을 수신했습니다. 혹은 연결이 끊겼습니다." << endl;
 			InterlockedExchange8((char*)&session->bDisconnected, true);
+			SessionUnlock(session);
 			if (InterlockedDecrement((LONG*)&session->ioCount) == 0) 
-				DisconnectSession(session);
+				ReleaseSession(session);
+			
 			continue;
 		}
 		
@@ -222,6 +245,11 @@ unsigned int WorkerThreadNetProc(void* arg)
 			// ------------------------------------------
 			// 다시 Recv 걸기
 			// ------------------------------------------
+			/*SessionLock(session);
+			bool recvPostRet = RecvPost(session);
+			if (recvPostRet)
+				SessionUnlock(session);*/
+
 			RecvPost(session);
 		}
 		else if (sessionOlp->type == ESend)
@@ -232,12 +260,16 @@ unsigned int WorkerThreadNetProc(void* arg)
 			session->sendQ->MoveFront(transferred);
 			cout << "------------CompletionPort : Send------------\n";
 			cout << "Send Complete / transferred : " << transferred << endl; 
-			InterlockedExchange(&session->bIsSending, false);
+			InterlockedExchange(&session->isSending, false);
 
 			//---------------------------------------------------------
 			// Send 송신 중에 SendQ에 전송할 데이터가 쌓였다면 다시 Send 
 			//---------------------------------------------------------
-			SendPost(session);
+			//SessionLock(session);
+			bool sendPostRet = SendPost(session);
+			if (sendPostRet == false)
+				continue;
+				//SessionUnlock(session);
 		}
 		
 
@@ -246,9 +278,12 @@ unsigned int WorkerThreadNetProc(void* arg)
 		// ----------------------------------------------------------------
 		if (InterlockedDecrement((LONG*)&session->ioCount) == 0)
 		{
-			DisconnectSession(session);
+			SessionUnlock(session);
+			ReleaseSession(session);
 			continue;
 		}
+
+		SessionUnlock(session);
 	}
 
 	return 0;
@@ -286,15 +321,20 @@ unsigned int EchoThreadProc(void* arg)
 
 void OnMessage(ULONG sessionId, CPacket* message)
 {
-	//-------------------------------------------
+	//------------------------------------------------------------
 	// - 간단한 에코 서버이므로, 메시지를 헤더 타입으로 분류하여 메시지 종류별 처리하는 과정은 생략
 	// - 현재 에코 더미 자체가 헤더 안에 메시지 타입을 기재하고 있지 않음
-	//-------------------------------------------
+	//------------------------------------------------------------
 	unsigned short payloadLen;
 	__int64 echoData;
 	*message >> payloadLen;
 	*message >> echoData;
 	
+
+	//-------------------------------------------------------------
+	// 에코(컨텐츠) 처리 스레드에게 작업 메시지를 생성 및 작업 큐에 인큐
+	// - Enqueue 할 때 락 무조건 필요!
+	//-------------------------------------------------------------
 	st_JobMessage jobMsg;
 	jobMsg.sessionId = sessionId;
 	jobMsg.echoData = echoData;
@@ -311,7 +351,20 @@ void OnMessage(ULONG sessionId, CPacket* message)
 
 bool SendPacket(ULONG sessionId, CPacket* packet)
 {
+	//---------------------------------------------------------------------------
 	// 세션 검색
+	// - Map에 대한 락을 풀기 전에 세션 락 걸기
+	// - 세션이 검색되면 락을 풀기 전까지 세션이 지워지지 않음을 보장할 수 있게된다.
+	// 
+	// [참고 사항]
+	// + 세션이 도중에 삭제되면 어떤 문제가 발생하는가?
+	//	1. session->lock이 0xdddd..로 밀렸다면 AcquireSRWLockExclusive에서 블로킹에 빠져버림 (실제로 나타나진 않았으나 별도의 테스트에서는 나타남)
+	//	2. session->lock이 0x0000..로 밀렸다면 AcquireSRWLockExclusive가 성공됨
+	//		- sendQ 멤버 함수 호출 시, this 콜에서 this가 0xffff...인 문제 발생 (실제로 나타난 결과)
+	//	3. 이미 삭제된 세션을 대상으로 다시 에코 처리 스레드에서 SendPost->DisconnectSession에서 문제 발생
+	//		- delete시 session 소멸자의 sendQ, recvQ의 소멸자에서 문제 발생
+	//		- 혹은 소멸자가 아니더라도 free할 때 힙 invalidate 문제 발생
+	//---------------------------------------------------------------------------
 	AcquireSRWLockExclusive(&g_SessionMapLock);
 	const auto it = g_SessionMap.find(sessionId);
 	if (it == g_SessionMap.end())
@@ -320,40 +373,42 @@ bool SendPacket(ULONG sessionId, CPacket* packet)
 		return false;
 	}
 	Session* session = it->second;
+	SessionLock(session);
 	ReleaseSRWLockExclusive(&g_SessionMapLock);
 	
-
-
-	AcquireSRWLockExclusive(&session->lock);
-	int enqueueRet = session->sendQ->Enqueue(packet->GetBufferPtr(), packet->GetDataSize());
-	ReleaseSRWLockExclusive(&session->lock);
-
 	//-------------------------------------------
+	// 세션 접근 및 사용
+	// 
 	// 송신 버퍼 공간이 모자랄 때 예외 처리
 	// - 종료 플래그를 활성화 -> 세션 종료 유도한다.
 	//-------------------------------------------
+	int enqueueRet = session->sendQ->Enqueue(packet->GetBufferPtr(), packet->GetDataSize());
 	if (enqueueRet == 0)
 	{
-		cout << " 송신 버퍼 공간이 모자랍니다. sendQ Free size == " << session->sendQ->GetFreeSize() << endl;
+		cout << "sendQ 공간이 모자랍니다." << endl;
 		InterlockedExchange8((char*)&session->bDisconnected, true);
+		SessionUnlock(session);
 		return false;
 	}
-	
-	SendPost(session);
+
+	int sendPostRet = SendPost(session);
+	if (sendPostRet)
+		SessionUnlock(session);
+
 	return true;
 }
 
-void RecvPost(Session* session)
+bool RecvPost(Session* session)
 {
 	if (session->bDisconnected)
-		return;
+		return true;
 
 	WSABUF wsaRecvBufArr[2];
 	int wsaBufCnt = 1;
 	int directEnqueueSize = session->recvQ->DirectEnqueueSize();
 	int totalFreeSize = session->recvQ->GetFreeSize();
 	if (totalFreeSize == 0 || session->bDisconnected)
-		return;
+		return true;
 	wsaRecvBufArr[0].buf = session->recvQ->GetRearBufferPtr();
 	wsaRecvBufArr[0].len = directEnqueueSize;
 	if (directEnqueueSize < totalFreeSize)
@@ -388,33 +443,34 @@ void RecvPost(Session* session)
 		else
 		{
 			if (InterlockedDecrement((LONG*)&session->ioCount) == 0)
-				DisconnectSession(session);
+			{
+				SessionUnlock(session);
+				ReleaseSession(session);
+				return false;
+			}
 			cout << "recv error : " << error;
 		}
 	}
+	return true;
 }
 
 
-void SendPost(Session* session)
+bool SendPost(Session* session)
 {
-	if (InterlockedCompareExchange(&session->bIsSending, true, false) == true || session->bDisconnected)
-		return;
-	
+	if (InterlockedCompareExchange(&session->isSending, true, false) == true || session->bDisconnected)
+		return true;
 	printf("------------AsyncSend  session id : %d------------\n", session->sessionId);
 	WSABUF wsaSendBufArr[2];
 	int wsaBufCnt = 1;
-	AcquireSRWLockExclusive(&session->lock);
 	int directDequeueSize = session->sendQ->DirectDequeueSize();
 	int totalUseSize = session->sendQ->GetUseSize();
 	if (totalUseSize == 0)
 	{
-		InterlockedExchange(&session->bIsSending, false);
-		ReleaseSRWLockExclusive(&session->lock);
-		return;
+		InterlockedExchange(&session->isSending, false);
+		return true;
 	}
 	wsaSendBufArr[0].buf = session->sendQ->GetFrontBufferPtr();
 	wsaSendBufArr[0].len = directDequeueSize;
-	ReleaseSRWLockExclusive(&session->lock);
 	if (directDequeueSize < totalUseSize)
 	{
 		int remainUseSize = totalUseSize - directDequeueSize;
@@ -422,11 +478,9 @@ void SendPost(Session* session)
 		wsaSendBufArr[1].len = remainUseSize;
 		wsaBufCnt = 2;
 	}
-
 	InterlockedIncrement((LONG*)&session->ioCount);
 	DWORD sendBytes;
 	int sendRet = WSASend(session->sock, wsaSendBufArr, wsaBufCnt, &sendBytes, 0, (WSAOVERLAPPED*)&session->sendOlp, nullptr);
-	
 	//-------------------------------------
 	// Fast I/O
 	//-------------------------------------
@@ -447,24 +501,58 @@ void SendPost(Session* session)
 		}
 		else
 		{
-			if (InterlockedDecrement((LONG*)&session->ioCount) == 0)
-				DisconnectSession(session);
 			cout << "send error : " << error << "\n";
+			if (InterlockedDecrement((LONG*)&session->ioCount) == 0)
+			{
+				SessionUnlock(session);
+				ReleaseSession(session);
+				return false;
+			}
 		}
 	}
+	return true;
+}
+
+void ReleaseSession(Session* session)
+{	
+	//------------------------------------------------------------------------
+	// 세션 맵에서 해당 세션 삭제
+	// 
+	// [ 예외 처리 ]
+	// - 이미 세션이 맵에서 지워진 경우
+	// - IOCP WorkerThread에서 ReleaseSession을 호출하여 다른 쪽의 세션 접근이 끝나기를 대기하고 있는 상황
+	//	 - 이미 맵에서 해당 세션이 삭제되었으므로 현재 컨텐츠 스레드에서 호출한 ReleaseSession에서는 바로 return
+	//		- 아래서 세션 접근이 끝나기를 대기하고 있는 스레드가 delete 하게 될 것
+	//------------------------------------------------------------------------
+	AcquireSRWLockExclusive(&g_SessionMapLock);
+	int eraseRet = g_SessionMap.erase(session->sessionId);
+	ReleaseSRWLockExclusive(&g_SessionMapLock);
+	if (eraseRet == 0)
+	{
+		//SessionUnlock(session);
+		return;
+	}
+	cout << "TryReleaseSession - id : " << session->sessionId << endl;
+
+	// -------------------------------------------
+	// 세션이 다른쪽에서 현재 사용 중이면
+	// - 사용이 끝날 때 까지 기다렸다가 delete
+	// -------------------------------------------
+	AcquireSRWLockExclusive(&session->lock);
+	ReleaseSRWLockExclusive(&session->lock);
+	closesocket(session->sock);
+	delete session;
 	return;
 }
 
-void DisconnectSession(Session* session)
+void SessionLock(Session* session)
 {
-	cout << "TryDeleteSession - id : " << session->sessionId << endl;
+	InterlockedIncrement(&session->lockRef);
+	AcquireSRWLockExclusive(&session->lock);
+}
 
-	closesocket(session->sock);
-
-	// 세션 맵에서 해당 세션 삭제
-	AcquireSRWLockExclusive(&g_SessionMapLock);
-	g_SessionMap.erase(session->sessionId);
-	ReleaseSRWLockExclusive(&g_SessionMapLock);
-
-	delete session;
+void SessionUnlock(Session* session)
+{
+	ReleaseSRWLockExclusive(&session->lock);
+	InterlockedDecrement(&session->lockRef);
 }

@@ -10,10 +10,62 @@ using namespace std;
 
 extern HANDLE hCp;
 extern unordered_map<unsigned int, Session*> g_SessionMap;
+
+
+class CTest2
+{
+public:
+	CTest2()
+	{
+		
+	}
+
+	int a;
+	int b;
+	int c;
+	int d;
+};
+class CTest
+{
+public:
+	CTest()
+	{
+		InitializeSRWLock(&lock);
+		count = 0;
+		str = new char[5];
+		t = new CTest2;
+	}
+
+	CTest2* t;
+	char s[5000];
+	char* str;
+	SRWLOCK lock;
+	LONG count;
+};
+
+void func(CTest* test)
+{
+	AcquireSRWLockExclusive(&test->lock);
+	delete test;
+	ReleaseSRWLockExclusive(&test->lock);
+	InterlockedIncrement(&test->count);
+}
+
+
+
 int main()
 {
-
 	NetStartUp();
+
+	//SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+	//Session* session = new Session(sock, 1);
+	//delete session;
+	//delete session;
+	//session->sendQ->GetFreeSize();
+	//AcquireSRWLockExclusive(&session->lock);
+	////ReleaseSRWLockExclusive(&session->lock);
+	//cout << "main lock release!\n";
+	//return 1;
 
 	//----------------------------------------------
 	// 스레드 생성
